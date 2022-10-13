@@ -3,7 +3,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 import Data.ByteString.Lazy qualified as BL
-import Data.Foldable (toList)
 import Data.Maybe (catMaybes)
 import Data.String (IsString)
 import Data.Text qualified as T
@@ -27,12 +26,13 @@ import Distribution.Client.ProjectPlanning
   )
 import Distribution.Client.ProjectPlanning.Types
 import Distribution.Client.Setup
+import Distribution.Client.Types.ConfiguredId
 import Distribution.Client.Types.PackageLocation
 import Distribution.Client.Types.Repo
 import Distribution.Client.Types.SourceRepo
 import Distribution.Compat.Directory (makeAbsolute)
 import Distribution.PackageDescription qualified as PD
-import Distribution.Pretty (prettyShow)
+import Distribution.Pretty (Pretty, prettyShow)
 import Distribution.Simple.Command
 import Distribution.Simple.Flag
 import Distribution.Types.PackageId
@@ -124,13 +124,17 @@ cabalDirLayoutFromProjectConfig
 
 makeNixPlan :: ElaboratedInstallPlan -> NExpr
 makeNixPlan elaboratedInstallPlan =
-  "srp" ==> "self" ==> mkNonRecSet pkgs
+  "srp"
+    ==> "self"
+    ==> mkNonRecSet
+      [ "install-plan" $= mkNonRecSet pkgs
+      ]
   where
     pkgs = [elaboratedPackageToNix ecp | InstallPlan.Configured ecp <- InstallPlan.toList elaboratedInstallPlan]
 
     elaboratedPackageToNix :: ElaboratedConfiguredPackage -> Binding NExpr
     elaboratedPackageToNix
-      ElaboratedConfiguredPackage
+      ecp@ElaboratedConfiguredPackage
         { elabUnitId,
           elabPkgSourceId = PackageIdentifier {pkgName, pkgVersion},
           elabFlagAssignment,
@@ -140,18 +144,24 @@ makeNixPlan elaboratedInstallPlan =
         } =
         T.pack (quoted $ prettyShow elabUnitId)
           $= mkNonRecSet
-            ( [ "pkg-name" $= mkStr (T.pack $ prettyShow pkgName),
-                "pkg-version" $= mkStr (T.pack $ prettyShow pkgVersion),
-                "flags" $= flagAssignmentToNix elabFlagAssignment,
-                "pkg-src" $= packageLocationToNix elabPkgSourceLocation elabPkgSourceHash
-              ]
-                ++ toList
-                  ( fmap
-                      ( \bs ->
-                          "pkg-cabal-file" $= mkIndentedStr 4 (T.decodeUtf8 $ BL.toStrict bs)
-                      )
-                      elabPkgDescriptionOverride
-                  )
+            ( catMaybes
+                [ Just $ "pkg-name" $= mkStr (prettyShowText pkgName),
+                  Just $ "pkg-version" $= mkStr (prettyShowText pkgVersion),
+                  Just $ "pkg-src" $= packageLocationToNix elabPkgSourceLocation elabPkgSourceHash,
+                  case flagAssignmentToNix elabFlagAssignment of
+                    fs | fs == emptySet -> Nothing
+                    fs -> Just ("flags" $= fs),
+                  case elabLibDependencies ecp of
+                    [] -> Nothing
+                    libdeps -> Just $ "lib-depends" $= mkList ["self" @. quoted (prettyShowText $ confInstId cid) | cid <- libdeps],
+                  case elabExeDependencies ecp of
+                    [] -> Nothing
+                    exedeps -> Just $ "exe-depends" $= mkList ["self" @. quoted (prettyShowText cid) | cid <- exedeps],
+                  case elabSetupDependencies ecp of
+                    [] -> Nothing
+                    setupdeps -> Just $ "setup-depends" $= mkList ["self" @. quoted (prettyShowText $ confInstId cid) | cid <- setupdeps],
+                  (\pdo -> "pkg-cabal-file" $= mkIndentedStr 4 (T.decodeUtf8 $ BL.toStrict pdo)) <$> elabPkgDescriptionOverride
+                ]
             )
 
 packageLocationToNix :: PackageLocation (Maybe FilePath) -> Maybe PackageSourceHash -> NExpr
@@ -173,7 +183,7 @@ packageLocationToNix (RemoteSourceRepoPackage srcRepo _) (Just srcHash) =
       "srp"
         @@ mkNonRecSet
           ( catMaybes
-              [ Just $ "type" $= mkStr (T.pack $ prettyShow repoType),
+              [ Just $ "type" $= mkStr (prettyShowText repoType),
                 Just $ "location" $= mkStr (T.pack srpLocation),
                 Just $ "sdist-sha256" $= mkStr (T.pack $ showHashValue srcHash),
                 (\b -> "branch" $= mkStr (T.pack b)) <$> srpBranch,
@@ -207,3 +217,6 @@ flagAssignmentToNix flagAssignment =
 
 quoted :: (IsString a, Semigroup a) => a -> a
 quoted str = "\"" <> str <> "\""
+
+prettyShowText :: Pretty a => a -> T.Text
+prettyShowText = T.pack . prettyShow
